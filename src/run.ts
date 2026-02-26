@@ -17,6 +17,7 @@ import { runConfigPreflight } from "./validate";
 import { resolveGitBaseline, writeStateBaseline } from "./operations";
 import { normalizeRelativePath, normalizeSlashes, unique } from "./utils/paths";
 import { commandNameFromInvocation } from "./system";
+import { readCacheMetrics, writeCacheMetrics, CacheMetrics } from "./cacheMetrics";
 
 const DEFAULT_CACHE_TTL_DAYS = 7;
 
@@ -68,6 +69,7 @@ export function executeRun(files: string[], cwd: string): CommandOutput {
   evictExpiredCacheEntries(cacheDir, loaded.config.cache_ttl_days ?? DEFAULT_CACHE_TTL_DAYS);
   const cached = readCacheEntry(cacheDir, hash);
   if (cached?.status === "pass") {
+    recordCacheHit(cwd);
     return {
       command: "run",
       status: "pass",
@@ -83,6 +85,8 @@ export function executeRun(files: string[], cwd: string): CommandOutput {
       static_checks_passed: false
     };
   }
+
+  recordCacheMiss(cwd);
 
   const staticChecks = runStaticChecks(loaded.config, changedSources, cwd);
   if (!staticChecks.ok) {
@@ -419,6 +423,25 @@ function runStaticChecks(
   }
 
   return { ok: true };
+}
+
+function recordCacheHit(cwd: string): void {
+  updateCacheMetrics(cwd, (metrics) => {
+    metrics.hits += 1;
+  });
+}
+
+function recordCacheMiss(cwd: string): void {
+  updateCacheMetrics(cwd, (metrics) => {
+    metrics.misses += 1;
+  });
+}
+
+function updateCacheMetrics(cwd: string, updater: (metrics: CacheMetrics) => void): void {
+  const metrics = readCacheMetrics(cwd);
+  updater(metrics);
+  metrics.updated_at = new Date().toISOString();
+  writeCacheMetrics(cwd, metrics);
 }
 
 function shouldScopeStaticCheck(invocation: string): boolean {

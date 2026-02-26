@@ -269,6 +269,61 @@ test("run uses convention fallback when map does not hold coverage edges", () =>
   assert.deepEqual(rows, ["src/app.ts|src/app.test.ts"]);
 });
 
+test("run records cache metrics for hits and misses", () => {
+  const cwd = mkTempProject();
+  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, ".test-oracle"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "src", "app.ts"), "export const value = 1;\n");
+  fs.writeFileSync(
+    path.join(cwd, "src", "app.test.ts"),
+    "import { test } from 'node:test'; test('ok', () => {});\n"
+  );
+
+  fs.writeFileSync(
+    path.join(cwd, ".test-oracle.yml"),
+    [
+      "ecosystem: node",
+      "test_command: \"node --test\"",
+      "coverage_command: \"node --version\"",
+      "test_pattern: \"src/**/*.test.ts\"",
+      "source_patterns:",
+      "  - \"src/**/*.ts\"",
+      "  - \"!src/**/*.test.ts\""
+    ].join("\n")
+  );
+
+  execFileSync(
+    "sqlite3",
+    [
+      path.join(cwd, ".test-oracle", "map.db"),
+      "CREATE TABLE file_tests (source_path TEXT NOT NULL, test_id TEXT NOT NULL, last_updated INTEGER NOT NULL, PRIMARY KEY (source_path, test_id)); INSERT INTO file_tests (source_path, test_id, last_updated) VALUES ('src/app.ts', 'src/app.test.ts', 1);"
+    ],
+    { stdio: "ignore" }
+  );
+
+  const metricsPath = path.join(cwd, ".test-oracle", "cache-metrics.json");
+
+  const first = runCommand(["src/app.ts"], cwd);
+  assert.equal(first.command, "run");
+  assert.equal(first.status, "pass");
+  assert.equal(first.stage, "execute");
+
+  const firstMetrics = JSON.parse(fs.readFileSync(metricsPath, "utf8"));
+  assert.equal(firstMetrics.misses, 1);
+  assert.equal(firstMetrics.hits, 0);
+  assert.equal(typeof firstMetrics.updated_at, "string");
+
+  const second = runCommand(["src/app.ts"], cwd);
+  assert.equal(second.command, "run");
+  assert.equal(second.status, "pass");
+  assert.equal(second.stage, "cache");
+
+  const secondMetrics = JSON.parse(fs.readFileSync(metricsPath, "utf8"));
+  assert.equal(secondMetrics.misses, 1);
+  assert.equal(secondMetrics.hits, 1);
+  assert.equal(typeof secondMetrics.updated_at, "string");
+});
+
 test("run fails in static stage and does not execute tests", () => {
   const cwd = mkTempProject();
   fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
