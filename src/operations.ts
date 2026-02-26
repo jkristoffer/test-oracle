@@ -1,25 +1,21 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import fg from "fast-glob";
 import {
   CommandError,
   CommandOutput,
   InitResult,
-  OracleConfig,
   ResetResult,
   StatusResult,
   ValidationResult
 } from "./contracts";
 import { loadConfig } from "./config";
 import { runConfigPreflight, validateProject } from "./validate";
-import { parseCommandInvocation } from "./system";
 import {
   computeCacheHitRate,
   readCacheMetrics,
   resetCacheMetrics
 } from "./cacheMetrics";
-import { normalizeRelativePath, normalizeSlashes } from "./path-utils";
 import { escapeSql } from "./sql-utils";
 import {
   computeFrameworkConfigSnapshot,
@@ -27,10 +23,10 @@ import {
   FRAMEWORK_CONFIG_FILES_KEY,
   FrameworkConfigSnapshot
 } from "./framework-config";
+import { getAdapter } from "./adapters";
+import { unknownEcosystemError } from "./output";
 
-const DEFAULT_CONVENTION_PATTERN = "{name}.test.{ext}";
 const MAP_SCHEMA_VERSION = "1";
-const MAX_ERROR_TEXT = 4000;
 const MAP_FRESH_WINDOW_SECONDS = 7 * 24 * 60 * 60;
 
 export function executeInit(cwd: string): CommandOutput {
@@ -59,25 +55,17 @@ export function executeInit(cwd: string): CommandOutput {
   const mapPath = path.join(oracleDir, "map.db");
   const statePath = path.join(oracleDir, "state");
 
-  const availableTests = fg
-    .sync([loaded.config.test_pattern], {
-      cwd,
-      onlyFiles: true,
-      dot: true,
-      ignore: ["**/node_modules/**", "**/.git/**"]
-    })
-    .map((file) => normalizeSlashes(file))
-    .sort();
-
-  if (availableTests.length === 0) {
-    return initFailureResult(
-      mapPath,
-      startedAt,
-      "test_pattern did not resolve test files during init."
-    );
+  const adapter = getAdapter(loaded.config.ecosystem);
+  if (!adapter) {
+    return withCommand(unknownEcosystemError(loaded.config.ecosystem, "init"), "init");
   }
 
-  const edges = buildInitEdges(availableTests, loaded.config, cwd);
+  let edges: Array<{ source: string; testId: string }>;
+  try {
+    edges = adapter.generateMap(loaded.config, cwd);
+  } catch (error) {
+    return initFailureResult(mapPath, startedAt, asErrorMessage(error));
+  }
   if (edges.length === 0) {
     return initFailureResult(
       mapPath,
@@ -234,40 +222,6 @@ function initFailureResult(mapPath: string, startedAt: number, error: string): I
     duration_ms: Date.now() - startedAt,
     error
   };
-}
-
-function buildInitEdges(
-  availableTests: string[],
-  config: OracleConfig,
-  cwd: string
-): Array<{ source: string; testId: string }> {
-  const normalizedTests = Array.from(
-    new Set(availableTests.map((test) => normalizeSlashes(test)))
-  ).sort();
-  const dedup = new Set<string>();
-  const edges: Array<{ source: string; testId: string }> = [];
-
-  for (const testId of normalizedTests) {
-    const coverageSources = collectCoverageSourcesForTest(config, cwd, testId);
-    if (coverageSources === null) {
-      return [];
-    }
-
-    for (const source of coverageSources) {
-      if (source.length === 0) {
-        continue;
-      }
-      const normalizedSource = normalizeSlashes(source);
-      const key = normalizedSource + "\n" + testId;
-      if (dedup.has(key)) {
-        continue;
-      }
-      dedup.add(key);
-      edges.push({ source: normalizedSource, testId });
-    }
-  }
-
-  return edges;
 }
 
 function rebuildMap(
@@ -436,188 +390,6 @@ function readConfigStatus(cwd: string): StatusResult["config"] {
   };
 }
 
-function runInvocation(
-  invocation: string,
-  cwd: string,
-  extraArgs: string[],
-  enablePassThrough: boolean
-): InvocationResult {
-  const parsed = parseCommandInvocation(invocation);
-  if (!parsed) {
-    return {
-      exitCode: 1,
-      stdout: "",
-      stderr: "Command is empty.",
-      durationMs: 0
-    };
-  }
-
-  const startMs = Date.now();
-  const args = appendExtraArgs(parsed.command, parsed.args, extraArgs, enablePassThrough);
-  const result = spawnSync(parsed.command, args, {
-    cwd,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  return {
-    exitCode: result.status ?? 1,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? (result.error?.message ?? ""),
-    durationMs: Date.now() - startMs
-  };
-}
-
-function appendExtraArgs(
-  command: string,
-  baseArgs: string[],
-  extraArgs: string[],
-  enablePassThrough: boolean
-): string[] {
-  if (extraArgs.length === 0) {
-    return [...baseArgs];
-  }
-
-  const lower = command.toLowerCase();
-  if (!enablePassThrough || !isPackageManager(lower)) {
-    return [...baseArgs, ...extraArgs];
-  }
-
-  if (baseArgs.includes("--")) {
-    return [...baseArgs, ...extraArgs];
-  }
-
-  return [...baseArgs, "--", ...extraArgs];
-}
-
-function isPackageManager(command: string): boolean {
-  return command === "npm" || command === "pnpm" || command === "yarn" || command === "bun";
-}
-
-function combineOutput(result: InvocationResult): string {
-  const parts = [result.stderr.trim(), result.stdout.trim()].filter((part) => part.length > 0);
-  return parts.join("\n");
-}
-
-function summarizeError(text: string): string {
-  if (text.trim().length === 0) {
-    return "Command failed with no output.";
-  }
-
-  if (text.length <= MAX_ERROR_TEXT) {
-    return text;
-  }
-
-  return text.slice(0, MAX_ERROR_TEXT);
-}
-
-function findCoveragePath(cwd: string): string | null {
-  const candidates = [
-    path.join(cwd, "coverage", "coverage-final.json"),
-    path.join(cwd, "coverage-final.json"),
-    path.join(cwd, ".nyc_output", "out.json")
-  ];
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
-
-function extractCoveredSources(coveragePath: string, cwd: string, config: OracleConfig): string[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(fs.readFileSync(coveragePath, "utf8"));
-  } catch {
-    return [];
-  }
-
-  if (!isRecord(parsed)) {
-    return [];
-  }
-
-  const knownSources = new Set(
-    fg
-      .sync(config.source_patterns, {
-        cwd,
-        onlyFiles: true,
-        dot: true,
-        ignore: ["**/node_modules/**", "**/.git/**"]
-      })
-      .map((file) => normalizeSlashes(file))
-  );
-
-  const covered = new Set<string>();
-  for (const key of Object.keys(parsed)) {
-    const normalized = normalizeRelativePath(cwd, key);
-    if (normalized.startsWith("../")) {
-      continue;
-    }
-    if (knownSources.has(normalized)) {
-      covered.add(normalized);
-    }
-  }
-
-  return Array.from(covered.values()).sort();
-}
-
-function cleanCoverageArtifacts(cwd: string): void {
-  const targets = [
-    path.join(cwd, "coverage"),
-    path.join(cwd, "coverage-final.json"),
-    path.join(cwd, ".nyc_output")
-  ];
-
-  for (const target of targets) {
-    try {
-      fs.rmSync(target, { recursive: true, force: true });
-    } catch {
-      // ignore cleanup failures
-    }
-  }
-}
-
-function collectCoverageSourcesForTest(
-  config: OracleConfig,
-  cwd: string,
-  testId: string
-): string[] | null {
-  cleanCoverageArtifacts(cwd);
-  const coverageRun = runInvocation(config.coverage_command, cwd, [testId], true);
-  if (coverageRun.exitCode !== 0) {
-    return null;
-  }
-
-  const coveragePath = findCoveragePath(cwd);
-  if (!coveragePath) {
-    return null;
-  }
-
-  return extractCoveredSources(coveragePath, cwd, config);
-}
-
-function resolveConventionFallback(
-  sourcePath: string,
-  pattern: string,
-  cwd: string
-): string | null {
-  const parsed = path.parse(sourcePath);
-  const extWithoutDot = parsed.ext.startsWith(".") ? parsed.ext.slice(1) : parsed.ext;
-  const filename = pattern
-    .replaceAll("{name}", parsed.name)
-    .replaceAll("{ext}", extWithoutDot);
-  const candidate = normalizeSlashes(path.join(parsed.dir, filename));
-  const absoluteCandidate = path.resolve(cwd, candidate);
-  if (fs.existsSync(absoluteCandidate)) {
-    return candidate;
-  }
-
-  return null;
-}
-
 export function writeStateBaseline(statePath: string, baseline: string | null): boolean {
   if (!baseline) {
     return false;
@@ -655,22 +427,10 @@ function isCommandError(value: ValidationResult | CommandError): value is Comman
   return "kind" in value && value.kind === "error";
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function asErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
 
   return String(error);
-}
-
-
-interface InvocationResult {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-  durationMs: number;
 }
