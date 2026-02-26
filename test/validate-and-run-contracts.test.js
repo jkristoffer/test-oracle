@@ -191,6 +191,84 @@ test("run returns no_tests_mapped when map exists but no mappings and no fallbac
   assert.equal(result.reason, "no_tests_mapped");
 });
 
+test("run uses convention fallback when map does not hold coverage edges", () => {
+  const cwd = mkTempProject();
+  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, "scripts"), { recursive: true });
+  fs.mkdirSync(path.join(cwd, ".test-oracle"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "src", "app.ts"), "export const value = 1;\n");
+  fs.writeFileSync(path.join(cwd, "src", "app.test.ts"), "test('ok', () => {});\n");
+
+  fs.writeFileSync(
+    path.join(cwd, "scripts", "pass-test.js"),
+    "const fs = require('node:fs'); fs.writeFileSync('executed.marker', 'yes'); process.exit(0);\n"
+  );
+  fs.writeFileSync(
+    path.join(cwd, "scripts", "write-coverage.js"),
+    [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const cwd = process.cwd();",
+      "const coverageDir = path.join(cwd, 'coverage');",
+      "fs.rmSync(coverageDir, { recursive: true, force: true });",
+      "fs.mkdirSync(coverageDir, { recursive: true });",
+      "const srcDir = path.join(cwd, 'src');",
+      "const testId = process.argv[2] ?? '';",
+      "const coverage = {};",
+      "if (testId.includes('src/app.test.ts')) {",
+      "  const target = path.join(srcDir, 'app.ts');",
+      "  coverage[target] = { path: target };",
+      "}",
+      "if (Object.keys(coverage).length === 0) {",
+      "  const fallback = path.join(srcDir, 'app.ts');",
+      "  coverage[fallback] = { path: fallback };",
+      "}",
+      "fs.writeFileSync(path.join(coverageDir, 'coverage-final.json'), JSON.stringify(coverage));"
+    ].join("\n")
+  );
+
+  execFileSync(
+    "sqlite3",
+    [
+      path.join(cwd, ".test-oracle", "map.db"),
+      "CREATE TABLE file_tests (source_path TEXT NOT NULL, test_id TEXT NOT NULL, last_updated INTEGER NOT NULL, PRIMARY KEY (source_path, test_id));"
+    ],
+    { stdio: "ignore" }
+  );
+
+  fs.writeFileSync(
+    path.join(cwd, ".test-oracle.yml"),
+    [
+      "ecosystem: node",
+      "test_command: \"node ./scripts/pass-test.js\"",
+      "coverage_command: \"node ./scripts/write-coverage.js\"",
+      "test_pattern: \"src/**/*.test.ts\"",
+      "source_patterns:",
+      "  - \"src/**/*.ts\"",
+      "  - \"!src/**/*.test.ts\""
+    ].join("\n")
+  );
+
+  const result = runCommand(["src/app.ts"], cwd);
+  assert.equal(result.command, "run");
+  assert.equal(result.status, "pass");
+  assert.equal(result.stage, "execute");
+  assert.deepEqual(result.tests_run, ["src/app.test.ts"]);
+
+  const rows = execFileSync(
+    "sqlite3",
+    [
+      path.join(cwd, ".test-oracle", "map.db"),
+      "SELECT source_path || '|' || test_id FROM file_tests ORDER BY source_path, test_id;"
+    ],
+    { encoding: "utf8" }
+  )
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0);
+  assert.deepEqual(rows, ["src/app.ts|src/app.test.ts"]);
+});
+
 test("run fails in static stage and does not execute tests", () => {
   const cwd = mkTempProject();
   fs.mkdirSync(path.join(cwd, "src"), { recursive: true });

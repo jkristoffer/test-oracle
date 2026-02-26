@@ -11,6 +11,12 @@ import {
 import { loadConfig, SUPPORTED_ADAPTERS } from "./config";
 import { commandNotFoundError, unknownEcosystemError } from "./output";
 import { commandNameFromInvocation, isCommandResolvable } from "./system";
+import { normalizeSlashes } from "./path-utils";
+import {
+  computeFrameworkConfigSnapshot,
+  FRAMEWORK_CONFIG_FINGERPRINT_KEY,
+  FRAMEWORK_CONFIG_FILES_KEY
+} from "./framework-config";
 
 export function validateProject(cwd: string): ValidationResult | CommandError {
   const loaded = loadConfig(cwd);
@@ -64,6 +70,8 @@ function buildValidationResult(config: OracleConfig, cwd: string): ValidationRes
   validatePattern(config.test_pattern, "test_pattern", cwd, errors);
   validateSourcePatterns(config.source_patterns, cwd, errors);
   warnings.push(...collectDeletedMapWarnings(cwd));
+  warnings.push(...collectFrameworkConfigDriftWarnings(cwd));
+  warnings.push(...collectMissingMapEntriesWarnings(config, cwd));
 
   return {
     command: "validate",
@@ -167,38 +175,9 @@ function collectDeletedMapWarnings(cwd: string): ValidationIssue[] {
     return [];
   }
 
+  let sourcePaths: string[];
   try {
-    const output = execFileSync(
-      "sqlite3",
-      [mapPath, "SELECT DISTINCT source_path FROM file_tests;"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
-    );
-
-    const sourcePaths = output
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-
-    let missingCount = 0;
-    for (const sourcePath of sourcePaths) {
-      const absolutePath = path.isAbsolute(sourcePath)
-        ? sourcePath
-        : path.resolve(cwd, sourcePath);
-      if (!fs.existsSync(absolutePath)) {
-        missingCount += 1;
-      }
-    }
-
-    if (missingCount > 0) {
-      return [
-        {
-          field: "map",
-          message: String(missingCount) + " entries reference deleted files"
-        }
-      ];
-    }
-
-    return [];
+    sourcePaths = readDistinctSourcePaths(mapPath);
   } catch (error) {
     return [
       {
@@ -207,6 +186,161 @@ function collectDeletedMapWarnings(cwd: string): ValidationIssue[] {
       }
     ];
   }
+
+  let missingCount = 0;
+  for (const sourcePath of sourcePaths) {
+    const absolutePath = path.isAbsolute(sourcePath)
+      ? sourcePath
+      : path.resolve(cwd, sourcePath);
+    if (!fs.existsSync(absolutePath)) {
+      missingCount += 1;
+    }
+  }
+
+  if (missingCount > 0) {
+    return [
+      {
+        field: "map",
+        message: String(missingCount) + " entries reference deleted files"
+      }
+    ];
+  }
+
+  return [];
+}
+
+function collectFrameworkConfigDriftWarnings(cwd: string): ValidationIssue[] {
+  const mapPath = path.join(cwd, ".test-oracle", "map.db");
+  if (!fs.existsSync(mapPath)) {
+    return [];
+  }
+
+  const storedFingerprint = readMapMetaValue(mapPath, FRAMEWORK_CONFIG_FINGERPRINT_KEY);
+  if (!storedFingerprint) {
+    return [];
+  }
+
+  const currentSnapshot = computeFrameworkConfigSnapshot(cwd);
+  if (currentSnapshot.fingerprint === storedFingerprint) {
+    return [];
+  }
+
+  const storedFiles = parseStoredFiles(
+    readMapMetaValue(mapPath, FRAMEWORK_CONFIG_FILES_KEY)
+  );
+  const currentSample = currentSnapshot.files.slice(0, 3).join(", ") || "none";
+  const storedSample = storedFiles.slice(0, 3).join(", ") || "none";
+
+  return [
+    {
+      field: "framework_config",
+      message:
+        "Framework config files changed since last `test-oracle init` (current: " +
+        currentSample +
+        "; stored: " +
+        storedSample +
+        "). Run `test-oracle init` to rebuild the map."
+    }
+  ];
+}
+
+function collectMissingMapEntriesWarnings(
+  config: OracleConfig,
+  cwd: string
+): ValidationIssue[] {
+  const mapPath = path.join(cwd, ".test-oracle", "map.db");
+  if (!fs.existsSync(mapPath)) {
+    return [];
+  }
+
+  let mapSources: string[];
+  try {
+    mapSources = readDistinctSourcePaths(mapPath);
+  } catch {
+    return [];
+  }
+
+  if (mapSources.length === 0) {
+    return [];
+  }
+
+  const sourceMatches = fg
+    .sync(config.source_patterns, {
+      cwd,
+      onlyFiles: true,
+      dot: true,
+      ignore: ["**/node_modules/**", "**/.git/**"]
+    })
+    .map((file) => normalizeSlashes(file));
+
+  const mapSet = new Set(mapSources);
+  const missing = sourceMatches.filter((file) => !mapSet.has(file));
+
+  if (missing.length === 0) {
+    return [];
+  }
+
+  const sample = missing.slice(0, 3).join(", ");
+  const plural = missing.length === 1 ? "file" : "files";
+  return [
+    {
+      field: "map",
+      message:
+        String(missing.length) +
+        " source " +
+        plural +
+        " from source_patterns have no map entries (example: " +
+        sample +
+        ")."
+    }
+  ];
+}
+
+function readDistinctSourcePaths(mapPath: string): string[] {
+  const output = execFileSync(
+    "sqlite3",
+    [mapPath, "SELECT DISTINCT source_path FROM file_tests;"],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+  );
+
+  return output
+    .split("\n")
+    .map((line) => normalizeSlashes(line.trim()))
+    .filter((line) => line.length > 0);
+}
+
+function readMapMetaValue(mapPath: string, key: string): string | null {
+  try {
+    const output = execFileSync(
+      "sqlite3",
+      [mapPath, `SELECT value FROM map_meta WHERE key = '${key}';`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }
+    )
+      .trim();
+    return output.length > 0 ? output : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseStoredFiles(value: string | null): string[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .map((item) => (typeof item === "string" ? item : ""))
+        .map((item) => normalizeSlashes(item))
+        .filter((item) => item.length > 0);
+    }
+  } catch {
+    // ignore parse errors
+  }
+
+  return [];
 }
 
 function mapValidationToCommandError(

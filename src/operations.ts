@@ -14,6 +14,19 @@ import {
 import { loadConfig } from "./config";
 import { runConfigPreflight, validateProject } from "./validate";
 import { parseCommandInvocation } from "./system";
+import {
+  computeCacheHitRate,
+  readCacheMetrics,
+  resetCacheMetrics
+} from "./cacheMetrics";
+import { normalizeRelativePath, normalizeSlashes } from "./path-utils";
+import { escapeSql } from "./sql-utils";
+import {
+  computeFrameworkConfigSnapshot,
+  FRAMEWORK_CONFIG_FINGERPRINT_KEY,
+  FRAMEWORK_CONFIG_FILES_KEY,
+  FrameworkConfigSnapshot
+} from "./framework-config";
 
 const DEFAULT_CONVENTION_PATTERN = "{name}.test.{ext}";
 const MAP_SCHEMA_VERSION = "1";
@@ -74,7 +87,14 @@ export function executeInit(cwd: string): CommandOutput {
   }
 
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const mapUpdated = rebuildMap(mapPath, edges, loaded.config.ecosystem, nowSeconds);
+  const snapshot = computeFrameworkConfigSnapshot(cwd);
+  const mapUpdated = rebuildMap(
+    mapPath,
+    edges,
+    loaded.config.ecosystem,
+    nowSeconds,
+    snapshot
+  );
   if (!mapUpdated) {
     return initFailureResult(
       mapPath,
@@ -113,6 +133,7 @@ export function executeStatus(cwd: string): StatusResult {
   const mapInfo = readMapStatus(mapPath);
   const cacheInfo = readCacheStatus(cacheDir);
   const configInfo = readConfigStatus(cwd);
+  const cacheMetrics = readCacheMetrics(cwd);
 
   return {
     command: "status",
@@ -124,7 +145,7 @@ export function executeStatus(cwd: string): StatusResult {
     },
     cache: {
       entries: cacheInfo.entries,
-      hit_rate: null
+      hit_rate: computeCacheHitRate(cacheMetrics)
     },
     config: configInfo
   };
@@ -162,6 +183,8 @@ export function executeReset(cwd: string): ResetResult {
       errors.push("cache: " + asErrorMessage(error));
     }
   }
+
+  resetCacheMetrics(cwd);
 
   const stateExisted = fs.existsSync(statePath);
   if (stateExisted) {
@@ -251,7 +274,8 @@ function rebuildMap(
   mapPath: string,
   edges: Array<{ source: string; testId: string }>,
   ecosystem: string,
-  nowSeconds: number
+  nowSeconds: number,
+  snapshot?: FrameworkConfigSnapshot
 ): boolean {
   const sql: string[] = [];
   sql.push("BEGIN TRANSACTION;");
@@ -287,6 +311,22 @@ function rebuildMap(
   sql.push(
     "INSERT INTO map_meta (key, value) VALUES ('schema_version', '" + MAP_SCHEMA_VERSION + "');"
   );
+  if (snapshot) {
+    sql.push(
+      "INSERT INTO map_meta (key, value) VALUES ('" +
+        FRAMEWORK_CONFIG_FINGERPRINT_KEY +
+        "', '" +
+        escapeSql(snapshot.fingerprint) +
+        "');"
+    );
+    sql.push(
+      "INSERT INTO map_meta (key, value) VALUES ('" +
+        FRAMEWORK_CONFIG_FILES_KEY +
+        "', '" +
+        escapeSql(JSON.stringify(snapshot.files)) +
+        "');"
+    );
+  }
   sql.push("COMMIT;");
 
   try {
@@ -578,30 +618,6 @@ function resolveConventionFallback(
   return null;
 }
 
-function normalizeRelativePath(cwd: string, filePath: string): string {
-  const absolutePath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-  const cwdReal = safeRealpath(cwd) ?? cwd;
-  const absoluteReal = safeRealpath(absolutePath) ?? absolutePath;
-
-  const candidates = [
-    path.relative(cwd, absolutePath),
-    path.relative(cwdReal, absoluteReal),
-    path.relative(cwdReal, absolutePath),
-    path.relative(cwd, absoluteReal)
-  ].filter((candidate) => candidate.length > 0);
-
-  const preferred =
-    candidates.find((candidate) => !candidate.startsWith("..")) ??
-    candidates[0] ??
-    path.basename(absolutePath);
-
-  return normalizeSlashes(preferred);
-}
-
-function normalizeSlashes(value: string): string {
-  return value.replaceAll("\\", "/");
-}
-
 export function writeStateBaseline(statePath: string, baseline: string | null): boolean {
   if (!baseline) {
     return false;
@@ -635,10 +651,6 @@ function withCommand(error: CommandError, command: string): CommandError {
   };
 }
 
-function escapeSql(value: string): string {
-  return value.replaceAll("'", "''");
-}
-
 function isCommandError(value: ValidationResult | CommandError): value is CommandError {
   return "kind" in value && value.kind === "error";
 }
@@ -655,13 +667,6 @@ function asErrorMessage(error: unknown): string {
   return String(error);
 }
 
-function safeRealpath(targetPath: string): string | null {
-  try {
-    return fs.realpathSync(targetPath);
-  } catch {
-    return null;
-  }
-}
 
 interface InvocationResult {
   exitCode: number;
