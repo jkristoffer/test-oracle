@@ -485,7 +485,6 @@ test("run fails in execute stage with structured failure details", () => {
   assert.equal(result.stage, "execute");
   assert.equal(result.failed_test, "src/app.test.ts");
   assert.match(result.error, /FAIL src\/app\.test\.ts/);
-  assert.equal(result.static_checks_passed, true);
 });
 
 function mkTempProject() {

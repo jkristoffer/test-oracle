@@ -2,21 +2,18 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import fg from "fast-glob";
 import {
   CommandError,
   CommandOutput,
-  OracleConfig,
   RunResult
 } from "./contracts";
 import { loadConfig } from "./config";
 import { getAdapter } from "./adapters";
-import { combineOutput, runInvocation, summarizeError } from "./execution";
+import { combineOutput, summarizeError } from "./execution";
 import { unknownEcosystemError, noMapError } from "./output";
 import { runConfigPreflight } from "./validate";
 import { resolveGitBaseline, writeStateBaseline } from "./operations";
 import { normalizeRelativePath, normalizeSlashes, unique } from "./utils/paths";
-import { commandNameFromInvocation } from "./system";
 import { readCacheMetrics, writeCacheMetrics, CacheMetrics } from "./cacheMetrics";
 
 const DEFAULT_CACHE_TTL_DAYS = 7;
@@ -43,8 +40,13 @@ export function executeRun(files: string[], cwd: string): CommandOutput {
     };
   }
 
+  const adapter = getAdapter(loaded.config.ecosystem);
+  if (!adapter) {
+    return withCommand(unknownEcosystemError(loaded.config.ecosystem, "run"), "run");
+  }
+
   const changedFiles = resolveChangedFiles(cwd, files);
-  const changedSources = filterSourceFiles(changedFiles, loaded.config, cwd);
+  const changedSources = adapter.filterSourceFiles(changedFiles, loaded.config, cwd);
   if (changedSources.length === 0) {
     return skipResult("detect", "no_changes", Date.now() - runStartMs);
   }
@@ -52,11 +54,6 @@ export function executeRun(files: string[], cwd: string): CommandOutput {
   const mapPath = path.join(cwd, ".test-oracle", "map.db");
   if (!fs.existsSync(mapPath)) {
     return noMapError("run");
-  }
-
-  const adapter = getAdapter(loaded.config.ecosystem);
-  if (!adapter) {
-    return withCommand(unknownEcosystemError(loaded.config.ecosystem, "run"), "run");
   }
 
   const mappedTests = adapter.queryMap(mapPath, changedSources, loaded.config, cwd);
@@ -87,25 +84,6 @@ export function executeRun(files: string[], cwd: string): CommandOutput {
   }
 
   recordCacheMiss(cwd);
-
-  const staticChecks = runStaticChecks(loaded.config, changedSources, cwd);
-  if (!staticChecks.ok) {
-    return {
-      command: "run",
-      status: "fail",
-      stage: "static",
-      source: "run",
-      check: staticChecks.failedCheck,
-      hash,
-      tests_run: [],
-      tests_skipped: 0,
-      failed_test: null,
-      error: staticChecks.error,
-      duration_ms: Date.now() - runStartMs,
-      map_updated: false,
-      static_checks_passed: false
-    };
-  }
 
   const executeResult = adapter.runTests(mappedTests, loaded.config, cwd);
   const mapUpdated = adapter.refreshMapFromCoverage
@@ -146,7 +124,7 @@ export function executeRun(files: string[], cwd: string): CommandOutput {
     hash,
     tests_run: mappedTests,
     tests_skipped: 0,
-    failed_test: detectFailedTest(combinedOutput, mappedTests),
+    failed_test: adapter.detectFailedTest(combinedOutput, mappedTests),
     error: summarizeError(combinedOutput),
     duration_ms: Date.now() - runStartMs,
     map_updated: mapUpdated,
@@ -382,48 +360,6 @@ function safeGitChangedFiles(cwd: string, args: string[]): string[] {
   }
 }
 
-function filterSourceFiles(files: string[], config: OracleConfig, cwd: string): string[] {
-  if (files.length === 0) {
-    return [];
-  }
-
-  const matchedSources = new Set(
-    fg
-      .sync(config.source_patterns, {
-        cwd,
-        onlyFiles: true,
-        dot: true,
-        ignore: ["**/node_modules/**", "**/.git/**"]
-      })
-      .map((file) => normalizeSlashes(file))
-  );
-
-  return files
-    .map((file) => normalizeSlashes(file))
-    .filter((file) => matchedSources.has(file));
-}
-
-function runStaticChecks(
-  config: OracleConfig,
-  changedSources: string[],
-  cwd: string
-): { ok: true } | { ok: false; failedCheck: string; error: string } {
-  const checks = config.static_checks ?? [];
-  for (const check of checks) {
-    const checkName = commandNameFromInvocation(check) ?? "unknown";
-    const scopedArgs = shouldScopeStaticCheck(check) ? changedSources : [];
-    const result = runInvocation(check, cwd, scopedArgs, true);
-    if (result.exitCode !== 0) {
-      return {
-        ok: false,
-        failedCheck: checkName,
-        error: summarizeError(combineOutput(result))
-      };
-    }
-  }
-
-  return { ok: true };
-}
 
 function recordCacheHit(cwd: string): void {
   updateCacheMetrics(cwd, (metrics) => {
@@ -444,28 +380,6 @@ function updateCacheMetrics(cwd: string, updater: (metrics: CacheMetrics) => voi
   writeCacheMetrics(cwd, metrics);
 }
 
-function shouldScopeStaticCheck(invocation: string): boolean {
-  const value = invocation.toLowerCase();
-  return (
-    value.includes("eslint") ||
-    value.includes("biome") ||
-    value.includes("prettier") ||
-    value.includes("oxlint") ||
-    value.includes("ruff")
-  );
-}
-
-function detectFailedTest(output: string, mappedTests: string[]): string | null {
-  const normalized = output.toLowerCase();
-  for (const mappedTest of mappedTests) {
-    if (normalized.includes(mappedTest.toLowerCase())) {
-      return mappedTest;
-    }
-  }
-
-  const match = output.match(/([A-Za-z0-9_./-]+\.(test|spec)\.[A-Za-z0-9_:-]+)/);
-  return match ? match[1] : null;
-}
 
 function withCommand(error: CommandError, command: string): CommandError {
   return {

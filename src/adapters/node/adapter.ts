@@ -94,6 +94,27 @@ export const nodeAdapter: TestAdapter = {
     return extractCoveredSources(coveragePath, cwd, config);
   },
 
+  filterSourceFiles(files, config, cwd) {
+    if (files.length === 0) {
+      return [];
+    }
+
+    const matchedSources = new Set(
+      fg
+        .sync(config.source_patterns, {
+          cwd,
+          onlyFiles: true,
+          dot: true,
+          ignore: ["**/node_modules/**", "**/.git/**"]
+        })
+        .map((file) => normalizeSlashes(file))
+    );
+
+    return files
+      .map((file) => normalizeSlashes(file))
+      .filter((file) => matchedSources.has(file));
+  },
+
   refreshMapFromCoverage(mapPath, mappedTests, config, cwd) {
     const edges = collectCoverageEdgesForTests(config, cwd, mappedTests);
     if (!edges || edges.length === 0) {
@@ -101,6 +122,18 @@ export const nodeAdapter: TestAdapter = {
     }
 
     return upsertCoverageMappings(mapPath, edges);
+  },
+
+  detectFailedTest(output, mappedTests) {
+    const normalized = output.toLowerCase();
+    for (const mappedTest of mappedTests) {
+      if (normalized.includes(mappedTest.toLowerCase())) {
+        return mappedTest;
+      }
+    }
+
+    const match = output.match(/([A-Za-z0-9_./-]+\.(test|spec)\.[A-Za-z0-9_:-]+)/);
+    return match ? match[1] : null;
   }
 };
 
